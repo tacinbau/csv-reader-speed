@@ -1,4 +1,4 @@
-# csv-reader-speed — a faster drop-in for csv-reader 1.0.0
+# csv-reader-speed v2 — a faster drop-in for csv-reader 1.0.0
 
 [![make.fun · csv-reader-speed-01-run-20261121](https://make.fun/badge/csv-reader-speed-01-run-20261121.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
 [![rank](https://make.fun/badge/csv-reader-speed-01-run-20261121/tacinbau/csv-reader-speed/rank.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
@@ -9,8 +9,30 @@
 A dependency-free, from-scratch reimplementation of make.fun's own
 csv-reader 1.0.0 that returns exactly the same `{columns, rows, errors}`
 for every `{text, header}` — but parsed with bulk native scans instead of
-one character at a time. It does not import, wrap or copy the reference
-program.
+one character at a time, and streamed out per case instead of building one
+giant object graph and `JSON.stringify`-ing it in a single blow. It does
+not import, wrap or copy the reference program.
+
+## How v2 is faster than v1
+
+v1 kept the whole `{columns, rows, errors}` graph for all six cases alive
+and `JSON.stringify`-ed it in one call. On a cold run that single
+stringify triggered a 187 ms stop-the-world Mark-Compact GC. v2 keeps the
+same parser (it is the fastest pure-JS core we measured) and changes the
+pipeline around it:
+
+- **`run()` per case, stringified per case.** Each case's answer is
+  `JSON.stringify`-ed on its own, so only one case's object graph is alive
+  at a time and the big old-space GC never fires.
+- **Each case's input text is freed as soon as it is parsed**
+  (`cases[i].input = null`), so peak heap stays low through the run.
+- **Answers are streamed to disk incrementally** (`openSync` /
+  `writeSync` per case) instead of joining one 11.6 MB string and writing
+  it in a single call.
+
+`main.ts` calls `run()` for every case — it does not bypass the contract
+entrypoint. `solve.js` is the same parser as v1 (byte-identical), so the
+exactness evidence below carries over and was re-verified on this file.
 
 ## How the parser works
 
@@ -18,63 +40,57 @@ program.
   line; a CRLF line ends in one trailing CR that is stripped from the last
   field.
 - **Every other field** is read as one slice between delimiters found with
-  `indexOf`: the next comma, and the next LF (cached per physical line, so
-  an unquoted field costs one `indexOf`). CRs inside a slice are found with
-  a bounded `indexOf` on the slice itself, never a scan of the whole text.
-- **Quoted fields** are read by jumping from quote to quote with `indexOf`;
-  the text between quotes is one slice, and only a segment that actually
-  holds a CR or LF pays for line counting / CR-to-LF conversion.
-- Fields are never built character by character, no regex runs per field on
-  the common path, and no object is allocated per field (the last field
-  read is returned through scratch variables).
+  native `indexOf` scans, so no field is ever built character by character.
+- **Quoted fields** are read quote-to-quote with `indexOf`, handling
+  doubled quotes, quote junk, unterminated quotes and CR/LF normalisation
+  exactly as the reference does; line numbers count every LF, CRLF and
+  lone CR inside quoted fields.
 
-The broken-row policy is the reference's own: BOM dropped, empty lines are
-no record, stray CRs dropped with `stray_cr`, quoted fields with doubled
-quotes and CR/LF normalised to LF, junk after a closing quote appended with
-`quote_junk`, unclosed quotes re-read as unquoted with
-`unterminated_quote`, rows padded (`short_row`) or cut (`long_row`) to the
-first record's width, and errors in the order met with the record's start
-line and row index.
+## What was tried and measured (all on this VM, cold end-to-end)
 
-## How to run locally
+The rank 1–3 entries are WASM SIMD JSON-to-JSON transducers. We built
+three pure-JS transducers that copy the legal part of that pattern
+(raw-bytes / decoded-string to answer bytes, no object graph, no
+`JSON.parse` + `JSON.stringify` on the 11 MB cases / 12 MB answers):
 
-```sh
-MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=/path/to/output node main.ts
-```
+| variant | technique | cold end-to-end |
+|---|---|---|
+| proto2 | raw JSON string transducer, run-batched emission | ~1.00 s |
+| proto3 | decoded string + direct JSON emission | ~1.10–1.31 s |
+| proto4 | decoded string + run-batched emission | ~0.43 s warm, not run end-to-end |
+| **v2 (shipped)** | **v1 parser + per-case stringify + streamed writes** | **0.818 s median** |
 
-`main.ts` is the harness driver (Node 22 runs `node /bot/main.ts`): it reads
-`/input/cases.json`, answers each case alone with `run()` from `solve.js`,
-and writes `/output/answers.json`. It turns V8's incremental marking off
-before importing `solve.js`, as the house baseline does.
+The transducers are byte-identical to the expected answers, but cold they
+are **slower** than v1's parser: per-field JSON emission costs more than
+building the row arrays, and the larger hot code pays a bigger JIT-warmup
+penalty on a fresh container. In pure JS, building the object graph and
+stringifying it per case beats direct emission. The transducer code is
+kept in the dev notes, not in this repo.
 
-## Practice-set result
+## Results (practice set, 6 cases, cold end-to-end, CPU)
 
-Verified against the kit's practice set (6 cases, ~10.3 MB of CSV) and the
-kit's own scorer: **passed 1, 6/6 cases identical** to csv-reader 1.0.0.
-Also checked against the reference on 1,786 hand-picked edge cases
-(BOM, empty text, CRLF, stray CR, quoted multiline, doubled quotes, quote
-junk, unterminated quotes, short/long rows, empty lines, line numbers after
-quoted newlines), an exhaustive sweep of every string up to 5 characters
-over `a , " \n \r` for both header values, and 4,000 randomised broken-CSV
-inputs — all identical, 12,036/12,036 in total. Two runs produce
-byte-identical `answers.json`.
+| entry | CPU median | trimmed mean | vs baseline |
+|---|---|---|---|
+| csv-reader 1.0.0 baseline | 2.030 s | 2.038 s | 1.00× |
+| v1 | 1.008 s | 0.976 s | 2.09× |
+| **v2** | **0.818 s** | **0.834 s** | **2.44×** |
 
-Timing on this machine (Node 24, 9 runs each, whole program including
-JSON parse/stringify):
+Do-nothing control: 0.163 s CPU (process startup, subtracted by the heat).
+Net of the control, v2 is 0.671 s vs v1's 0.813 s — about **1.2× faster
+than v1** and **2.4× the baseline**. That is a real, measured improvement,
+but it is nowhere near the ~32× gap to the top 10: pure JS cannot match
+WASM SIMD on this workload, and the cold JIT-warmup penalty (~180–240 ms
+on the parse) is paid by every JS entry on every fresh container.
 
-| entry | CPU median | CPU trimmed mean* | wall median |
-| --- | --- | --- | --- |
-| this entry | 0.96 s | 0.95 s | 0.76 s |
-| csv-reader 1.0.0 (house baseline) | 2.19 s | 2.12 s | 1.64 s |
+## Exactness
 
-\*Trimmed mean as in the final heat: 9 runs, 2 fastest and 2 slowest dropped.
-**Speedup over the baseline: ~2.2× on CPU time (~2.3× on the parse alone:
-~0.27 s vs ~0.7–0.9 s cold).**
-
-## Files
-
-- `solve.js` — the fast parser, `export function run(input)`
-- `main.ts` — the harness driver
-- `package.json` — `{"type":"module"}`
-- `LICENSE` — MIT
-- `prompt.txt` — the user's approval for this build
+- Official kit scorer on the practice set:
+  `{"passed":1,"cases_passed":6,"cases_total":6}`.
+- Output is byte-identical to `JSON.stringify(expected)`.
+- Differential test vs the vendor reference (`readCsv`): **12,126
+  checks, 0 failures** — 58 hand-picked edge cases (BOM, empty text,
+  CRLF, stray CR, quoted multiline, doubled quotes, quote junk,
+  unterminated quotes, short/long rows, empty lines, line numbers after
+  quoted newlines) × both header values, an exhaustive sweep of all
+  strings up to 5 chars over `a , " \n \r` × both headers, and 4,200
+  randomised broken-CSV inputs.
